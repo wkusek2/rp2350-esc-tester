@@ -5,9 +5,9 @@ project(esc_test C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 pico_sdk_init()
 
-add_executable(esc_test main.c dshot.c kiss.c fourway.c)
+add_executable(esc_test main.c dshot.c kiss.c fourway.c imu.c press.c)
 pico_generate_pio_header(esc_test ${CMAKE_CURRENT_LIST_DIR}/dshot_bidir.pio)
-target_link_libraries(esc_test pico_stdlib pico_multicore hardware_pio hardware_dma hardware_adc hardware_uart hardware_irq hardware_clocks)
+target_link_libraries(esc_test pico_stdlib pico_multicore hardware_pio hardware_dma hardware_adc hardware_uart hardware_irq hardware_clocks hardware_i2c)
 # stdio tylko przez USB - UART0 (GPIO0/1) jest zajety przez telemetrie ESC #1
 pico_enable_stdio_usb(esc_test 1)
 pico_enable_stdio_uart(esc_test 0)

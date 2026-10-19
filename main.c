@@ -13,6 +13,9 @@
 #include "dshot.h"
 #include "kiss.h"
 #include "fourway.h"
+#include "imu.h"
+#include "press.h"
+#include "hardware/i2c.h"
 
 // ---- pinout ----
 static const uint8_t MOTOR_PINS[N_MOTORS] = { 2, 3, 4, 5, 10, 11, 12, 13 };
@@ -20,6 +23,9 @@ static const uint8_t MOTOR_PINS[N_MOTORS] = { 2, 3, 4, 5, 10, 11, 12, 13 };
 #define TLM1_RX_PIN 9    // UART1 RX  <- ESC #2 TLM
 #define CUR0_PIN   26    // ADC0      <- ESC #1 CUR
 #define CUR1_PIN   27    // ADC1      <- ESC #2 CUR
+#define I2C_SDA_PIN 14   // I2C1 SDA  <- IMU LSM6DSO32 + MS5837 (0x76) + MS5803 (0x77)
+#define I2C_SCL_PIN 15   // I2C1 SCL
+#define IMU_INT_PIN  6   // LSM6DSO32 INT1 (DRDY zyro)
 
 #define DSHOT_LOOP_US   1000      // 1 kHz
 #define TLM_REQ_MS      10        // co ile ms zadanie telemetrii KISS (na ESC, rotacja silnikow)
@@ -127,6 +133,8 @@ static bool  g_3d = false;
 static uint32_t g_log_ms = 500;
 static float g_cur_mv_per_a = 25.0f;   // skala czujnika pradu ESC (BF scale 250 = 25 mV/A) - ustaw 'cs'
 static float g_cur_off_mv[2] = { 0, 0 };
+static imu_t g_imu;
+static press_bus_t g_press;
 
 static uint16_t pct_to_dshot(int pct) {
     if (pct == 0) return 0;
@@ -235,9 +243,25 @@ static void print_help(void) {
       "  log <ms>|off            okres wydruku statusu (teraz %lu)\n"
       "  stat                    jednorazowy status\n"
       "  zero                    zeruj liczniki\n"
+      "  env / imucal / axes <f> <l> <g> / p0 / rho <kg/m3>   IMU i cisnienie\n"
       "  pins                    diagnostyka linii TLM/CUR\n"
       "  4way                    tryb BLHeliSuite32 (interfejs 4way-if); wyjscie: Disconnect w Suite lub wpisz exit\n",
       g_poles, (unsigned long)(g_rate / 1000), g_cur_mv_per_a, (unsigned long)g_log_ms);
+}
+
+static void print_env(void) {
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (g_imu.present)
+        printf("IMU roll=%6.1f pitch=%6.1f yaw=%6.1f | gyro %6.1f %6.1f %6.1f dps | acc %5.2f %5.2f %5.2f g | T=%.1fC n=%lu err=%lu%s (%lums temu)\n",
+               g_imu.roll, g_imu.pitch, g_imu.yaw, g_imu.gx, g_imu.gy, g_imu.gz, g_imu.ax, g_imu.ay, g_imu.az, g_imu.temp_C,
+               (unsigned long)g_imu.n_samples, (unsigned long)g_imu.n_err, g_imu.calibrating ? " KALIBRACJA" : "", (unsigned long)(now - g_imu.last_ms));
+    else printf("IMU: brak (LSM6DSO32 nie odpowiada na I2C1)\n");
+    for (int i = 0; i < 2; i++) {
+        const press_t *ps = &g_press.s[i];
+        if (!ps->present) { printf("%s: brak\n", ps->name); continue; }
+        printf("%s P=%8.2f mbar T=%5.2fC h=%7.3f m (p0=%.2f) ok=%lu err=%lu (%lums temu)\n", ps->name, ps->p_mbar, ps->t_C,
+               press_depth_m(&g_press, i), ps->p0_mbar, (unsigned long)ps->n_ok, (unsigned long)ps->n_err, (unsigned long)(now - ps->last_ms));
+    }
 }
 
 static void print_status(void) {
@@ -263,6 +287,7 @@ static void print_status(void) {
         else printf(" | KISS --");
         printf("\n");
     }
+    print_env();
     for (int e = 0; e < 2; e++) {
         float mv = read_cur_mv(e);
         printf("ESC%d CUR=%6.1f mV -> %5.2f A | KISS ramek=%lu crc_err=%lu\n", e + 1, mv,
@@ -420,6 +445,14 @@ static void handle_line(char *line) {
     else if (!strcmp(c, "pins")) print_pins();
     else if (!strcmp(c, "4way")) start_4way(false);
     else if (!strcmp(c, "msplog")) print_msplog();
+    else if (!strcmp(c, "env")) print_env();
+    else if (!strcmp(c, "imucal")) { imu_start_cal(&g_imu); printf("kalibracja zyro: nie ruszac 2 s\n"); }
+    else if (!strcmp(c, "axes")) {
+        if (n < 4 || !imu_set_axes(&g_imu, tok[1], tok[2], tok[3])) { printf("uzycie: axes <przod> <lewo> <gora>, np. axes x y z albo axes -y x z\n"); return; }
+        printf("osie: przod=%s lewo=%s gora=%s\n", tok[1], tok[2], tok[3]);
+    }
+    else if (!strcmp(c, "p0")) { press_zero(&g_press); printf("p0 = %.2f / %.2f mbar\n", g_press.s[0].p0_mbar, g_press.s[1].p0_mbar); }
+    else if (!strcmp(c, "rho")) { if (n > 1) g_press.rho = (float)atof(tok[1]); printf("rho=%.1f kg/m3\n", g_press.rho); }
     else if (!strcmp(c, "pwm")) {       // 1000..2000 jak PWM w trybie 3D: 1500 = stop, <1500 wstecz, >1500 naprzod
         uint8_t mask = parse_motor(tok[1]);
         if (!mask || n < 3) { printf("uzycie: pwm <1-8|all|e1|e2> <1000..2000>\n"); return; }
@@ -475,6 +508,16 @@ int main(void) {
     tlm_uart_init(uart0, TLM0_RX_PIN, UART0_IRQ, uart0_irq);
     tlm_uart_init(uart1, TLM1_RX_PIN, UART1_IRQ, uart1_irq);
     multicore_launch_core1(core1_main);
+
+    // I2C1: IMU + czujniki cisnienia
+    i2c_init(i2c1, 400000);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C); gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN); gpio_pull_up(I2C_SCL_PIN);
+    gpio_init(IMU_INT_PIN); gpio_set_dir(IMU_INT_PIN, GPIO_IN); gpio_pull_down(IMU_INT_PIN);
+    if (!imu_init(&g_imu, i2c1, 0x6A)) imu_init(&g_imu, i2c1, 0x6B);
+    if (g_imu.present) imu_start_cal(&g_imu);
+    press_init(&g_press, i2c1);
+    uint32_t imu_last_us = time_us_32();
 
     char line[64]; int ll = 0;
     uint32_t last_log = 0, usb_lost_ms = 0;
@@ -549,6 +592,16 @@ int main(void) {
                 k_crc_err[e] += k_par[e].n_crc - before;
             }
         }
+
+        // IMU: po przerwaniu DRDY (INT1 high) albo awaryjnie co 10 ms; cisnienie: maszyna stanow
+        if (g_imu.present) {
+            uint32_t tu = time_us_32();
+            if (gpio_get(IMU_INT_PIN) || tu - imu_last_us > 10000) {
+                float dt = (float)(tu - imu_last_us) * 1e-6f; imu_last_us = tu;
+                imu_read(&g_imu, i2c1, dt);
+            }
+        }
+        press_poll(&g_press);
 
         if (g_log_ms && now - last_log >= g_log_ms && conn) { last_log = now; print_status(); }
         sleep_ms(1);

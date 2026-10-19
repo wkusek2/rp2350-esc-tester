@@ -18,8 +18,14 @@ telemetry, and lets **BLHeliSuite32 configure the ESCs directly through the Pico
   minimal MSP responder, so BLHeliSuite32 "BLHeli32 Bootloader
   (Betaflight/Cleanflight)" can read and write ESC settings over the Pico's USB
   port. The bootloader bit-bang runs on core 1 with no interrupts.
+- IMU (Adafruit LSM6DSO32 on I2C1, 208 Hz, data-ready interrupt) with a Mahony
+  filter: roll, pitch, relative yaw, gyro bias calibration, configurable axis
+  mapping for the mounting orientation.
+- Pressure/depth: TE MS5837-02BA (0x76) and MS5803-05BA (0x77) on the same I2C
+  bus, non-blocking state machine, surface zeroing, water density setting.
 - Failsafe: all motors stop when USB disconnects.
 
+IMU and pressure drivers are written but not yet verified on hardware.
 Tested with 2x Diatone MAMBA F45 128K (BLHeli_32 Rev 32.8, layout
 `MAMBA_F45_128K_F4201`).
 
@@ -33,6 +39,8 @@ Tested with 2x Diatone MAMBA F45 128K (BLHeli_32 Rev 32.8, layout
 | GPIO9 | ESC #2 TLM (UART1 RX) |
 | GPIO26 | ESC #1 CUR (ADC0) |
 | GPIO27 | ESC #2 CUR (ADC1) |
+| GPIO14 / GPIO15 | I2C1 SDA / SCL: LSM6DSO32 (0x6A), MS5837-02BA (0x76), MS5803-05BA (0x77) |
+| GPIO6 | LSM6DSO32 INT1 (data ready) |
 | VSYS | 5 V from BEC |
 | GND | common ground with both ESCs |
 
@@ -72,6 +80,10 @@ cmd <m> <0..47> [n]      send a DShot command n times (motors must be stopped)
 poles <n>                motor pole count used for RPM
 rate 150|300|600|1200    DShot rate
 stat / rpm / log <ms>    status, one-line eRPM + current, periodic status
+env                      IMU attitude/rates and pressure/depth in one shot
+imucal                   gyro bias calibration (keep still for 2 s; also runs at boot)
+axes <fwd> <left> <up>   IMU axis mapping, e.g. "axes -y x z"
+p0 / rho <kg/m3>         zero depth at the surface / water density (997 fresh, 1025 sea)
 pins / info <m> / bl <m> diagnostics: TLM lines, ESC info frame, bootloader probe
 4way                     enter BLHeliSuite32 mode manually (exit: Disconnect in Suite or type exit)
 ```
@@ -101,6 +113,8 @@ the Suite opens the port at 1200 baud when it "reboots the flight controller".
 - `dshot.c/.h`, `dshot_bidir.pio` - bidirectional DShot on PIO + DMA, GCR decode
 - `kiss.c/.h` - KISS telemetry frame parser
 - `fourway.c/.h` - 4-way interface and BLHeli bootloader bit-bang (core 1)
+- `imu.c/.h` - LSM6DSO32 driver + Mahony attitude filter
+- `press.c/.h` - MS5837 / MS5803 pressure sensors, depth
 - `USTAWIENIA_ESC.txt` - bench notes and ESC settings (Polish)
 
 ## License
