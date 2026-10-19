@@ -1,0 +1,207 @@
+=====================================================================
+ USTAWIENIA I PROGRAMOWANIE ESC - stanowisko testowe ROV
+ RP2350 (Waveshare) + 2x Diatone Mamba F45 128K 4-in-1 (BLHeli_32 32.8)
+ stan na 2026-10-19
+=====================================================================
+
+1. PODLACZENIE (zweryfikowane - wszystko odpowiada)
+---------------------------------------------------------------------
+ESC #1 (silniki M1-M4)            ESC #2 (silniki M5-M8)
+  M1  -> GPIO2  DShot (PIO0 SM0)    M1  -> GPIO10 DShot (PIO1 SM0)
+  M2  -> GPIO3  DShot (PIO0 SM1)    M2  -> GPIO11 DShot (PIO1 SM1)
+  M3  -> GPIO4  DShot (PIO0 SM2)    M3  -> GPIO12 DShot (PIO1 SM2)
+  M4  -> GPIO5  DShot (PIO0 SM3)    M4  -> GPIO13 DShot (PIO1 SM3)
+  TLM -> GPIO1  UART0 RX            TLM -> GPIO9  UART1 RX
+  CUR -> GPIO26 ADC0                CUR -> GPIO27 ADC1
+  GND -> GND                        GND -> GND
+  VBAT -> NIE podlaczac do RP2350 (to napiecie baterii)
+
+Zasilanie RP2350: BEC 5 V -> VSYS. Wspolna masa RP2350 + oba ESC + BEC.
+USB-C tylko do konsoli i wgrywania (port COM3, USB CDC).
+
+UWAGA: UART0 (GPIO0/1) jest zajety przez telemetrie ESC #1, dlatego
+stdio po UART w firmware jest WYLACZONE (tylko USB).
+
+Historia usterek (naprawione):
+  - CUR ESC #1 pokazywal 620 mV w spoczynku -> zimny lut, po poprawce ~15 mV.
+  - TLM ESC #1 nie dochodzil do GPIO1 (przewod zle przylutowany), po poprawce OK.
+
+2. PROTOKOL DSHOT - jak jest skonfigurowany firmware
+---------------------------------------------------------------------
+Predkosc:        DShot300 (domyslnie), do zmiany 'rate 150|300|600|1200'
+                 BLHeli_32 obsluguje wszystkie cztery, AM32 nie ma 1200.
+Tryb:            BIDIRECTIONAL (ramka odwrocona, stan spoczynkowy = HIGH)
+                 BLHeli_32 wykrywa bidir automatycznie po inwersji sygnalu
+                 (wymaga BLHeli_32 >= 32.7). Nic nie trzeba wlaczac w ESC.
+Czestotliwosc:   1000 ramek/s na kazdy silnik (petla na rdzeniu 1)
+Ramka 16 bit:    [11 bit wartosc][1 bit zadanie telemetrii][4 bit CRC]
+                 CRC bidir = ~(v ^ v>>4 ^ v>>8) & 0xF   (odwrocone!)
+Wartosci:        0        = silnik stoi / rozbrojony (wysylane ciagle)
+                 1..47    = komendy DShot (tylko przy zatrzymanym silniku)
+                 48..2047 = gaz (0..100%)
+                 tryb 3D: 48..1047 = kierunek A, 1048..2047 = kierunek B
+Uzbrojenie:      BLHeli_32 uzbraja sie po ok. 1-2 s ciaglego odbioru
+                 wartosci 0. Firmware wysyla 0 od startu, wiec po
+                 wlaczeniu zasilania wystarczy odczekac i dac gaz.
+Failsafe:        po utracie polaczenia USB (> 1 s) firmware ustawia 0
+                 na wszystkich silnikach. ESC sam wylacza silnik,
+                 jesli przestanie dostawac ramki.
+
+3. ODPOWIEDZ BIDIR (eRPM) - co firmware dekoduje
+---------------------------------------------------------------------
+ESC odpowiada ~30 us po ramce, 21 bitow GCR, 5/4 predkosci wejsciowej
+(DShot300 -> 375 kbit/s). Firmware probkuje linie w PIO (8 probek/bit),
+dekoduje GCR i sprawdza CRC. Wynik: eRPM, a RPM = eRPM / (bieguny/2).
+  'poles <n>'  - liczba biegunow silnika, domyslnie 14. USTAW wedlug
+                 silnikow w ROV, inaczej RPM bedzie zle (eRPM dobre).
+  0x0FFF       = silnik stoi.
+Statystyki w statusie: ok / crc / none (brak odpowiedzi). Na stanowisku:
+0 bledow CRC na 8 silnikach, 'none' tylko przez pierwsze ~2 s po
+wlaczeniu ESC (ESC sie jeszcze bootuje).
+
+EDT (Extended DShot Telemetry) - temperatura, napiecie, prad w ramkach
+bidir, bez przewodu TLM. Wymaga BLHeli_32 >= 32.10. Wlaczanie:
+komenda DShot 13 wyslana 6x przy stojacych silnikach -> w konsoli 'edt'.
+Po tym ramki z bitem 8 = 0 to EDT: 0x2xx temp [C], 0x4xx napiecie
+[0.25 V], 0x6xx prad [A], 0xCxx stres, 0xExx status.
+
+4. TELEMETRIA KISS PO PRZEWODZIE TLM (dziala na obu ESC)
+---------------------------------------------------------------------
+UART 115200 8N1, ESC tylko nadaje. Ramka 10 bajtow:
+  [0] temp C | [1-2] napiecie 0.01 V | [3-4] prad 0.01 A |
+  [5-6] mAh | [7-8] eRPM/100 | [9] CRC8 (poly 0x07)
+W 4-in-1 wszystkie 4 silniki dziela JEDEN przewod TLM, wiec ESC
+odpowiada tylko ten silnik, ktory dostal bit telemetrii w ramce DShot.
+Firmware pyta po kolei: co 10 ms jeden silnik na ESC, czyli kazdy
+silnik co 40 ms. Na stanowisku: ~120 ramek/s na ESC, 0 bledow CRC.
+Temperatura w KISS = 0 C na tych ESC (prawdopodobnie firmware ESC
+nie raportuje temperatury w KISS - sprawdzic EDT).
+
+5. CZUJNIK PRADU (CUR)
+---------------------------------------------------------------------
+Analog 0-3.3 V na ADC. Firmware liczy A = (mV - offset) / skala.
+  'cs <mV/A>'  - skala, domyslnie 25 mV/A (= "scale 250" w Betaflight,
+                 typowe dla Mamba F55; NIE zweryfikowane - zmierz
+                 znanym obciazeniem i popraw)
+  'cz'         - zeruj offset przy stojacych silnikach
+Spoczynek: ESC #1 ~15 mV, ESC #2 ~21 mV.
+
+6. KOMENDY DSHOT I CO USTAWIC W ESC
+---------------------------------------------------------------------
+Komendy DShot (konsola: 'cmd <silnik|all|e1|e2> <nr> [powtorzen]'):
+   0        rozbrojenie
+   1-5      beep 1-5                  ('beep [n]')
+   6        info ESC
+   7 / 8    kierunek obrotow 1 / 2 (tymczasowo)
+   9 / 10   tryb 3D OFF / ON         ('3d off' / '3d on')
+   12       ZAPIS ustawien           ('save')
+   13       wlacz EDT                ('edt')
+   20 / 21  kierunek normal / reverse ('dir <m> n|r')
+   wiekszosc komend trzeba wyslac 6x (firmware robi to domyslnie),
+   zawsze przy stojacych silnikach, potem 'save' zeby zostalo po
+   wylaczeniu zasilania.
+
+Dla ROV (kazdy silnik w obie strony) zalecana konfiguracja ESC:
+   - tryb 3D: 'cmd all 10' lub '3d on', potem 'save'
+     (wtedy gaz w konsoli: 't <m> -100..100')
+   - kierunek per silnik wedlug montazu: 'dir <m> r' + 'save'
+   - w BLHeli32 Suite (przez passthrough FC lub programator, NIE da sie
+     tego zrobic po DShot):
+       * Motor Direction: Normal/Reversed lub Bidirectional (3D)
+       * Low RPM Power Protect: OFF dla silnikow z duza iloscia biegunow
+         / wolnych pedow ROV (inaczej ESC tnie moc przy niskich obrotach)
+       * Startup Power / Rampup Power: niskie (woda = duze obciazenie
+         od zera), np. 25-50%
+       * PWM Frequency: 24 kHz (domyslne) lub 48 kHz dla cichszej pracy
+       * Motor Timing: Auto
+       * Demag Compensation: High (silniki pod woda, duza bezwladnosc)
+       * Brake On Stop: wedlug potrzeb (dla ROV zwykle OFF)
+       * Sine Modulation (jesli jest): OFF
+       * Telemetry: nie trzeba nic - KISS jest zawsze, EDT po komendzie 13
+   - bidirectional DShot: nic nie ustawiac, wykrywany automatycznie.
+
+Odczyt i zapis ustawien ESC: przez BLHeliSuite32 bezposrednio z tego
+Pico (patrz punkt 6a) - Pico udaje kontroler lotu z passthrough.
+
+6a. BLHELISUITE32 PRZEZ PICO (tryb 4-way) - DZIALA, przetestowane na 8 ESC
+---------------------------------------------------------------------
+Pico implementuje interfejs 4-way (jak Betaflight) + minimalny MSP.
+Jak uzyc:
+  1. Zasilone ESC, Pico na USB (COM3), zadna konsola nie trzyma portu.
+  2. (zalecane) w konsoli wpisz '4way' i odczekaj 6 s - DShot staje,
+     linie sygnalowe ida w stan wysoki. Zamknij konsole.
+  3. BLHeliSuite32 -> interfejs "BLHeli32 Bootloader (Betaflight/Cleanflight)"
+     -> port COM3 -> Connect -> Read Setup.
+     Krok 2 mozna pominac: Suite sam przelacza Pico w tryb 4-way (MSP
+     SET_4WAY_IF albo pierwsza ramka '/'). Wtedy pierwszy ESC odpowie
+     dopiero po ~5.5 s, bo:
+  !! BLHeli_32 wchodzi w bootloader TYLKO gdy linia sygnalowa jest
+     wysoka i bez sygnalu przez >2 s (w praktyce 2.5 s za malo, 5 s OK).
+     Firmware czeka 5.5 s ciszy na linii przed polaczeniem z danym ESC
+     i ponawia raz, gdy sie nie uda.
+  4. Po zmianach: Write Setup, Disconnect. ESC wracaja do DShot po ~2 s
+     (licznik 'none' chwilowo rosnie). Dla pewnosci przepiac baterie.
+  5. Wyjscie z trybu 4-way: Disconnect w Suite, wpisanie 'exit' na
+     porcie, albo odpiecie USB.
+Zweryfikowane: sygnatura ESC 0x1506 (ARM/BLHeli_32), bootloader v7,
+odczyt flasha (np. 0x7C00) na 8 silnikach, kilka przebiegow z rzedu.
+Diagnostyka: 'bl <m> <tryb> <hold_ms>' - sonda bootloadera (tryb 1,
+hold 5000 = sprawdzone), 'info <m>' - zrzut ESC info (cmd DShot 6).
+
+ESC rzeczywiste: layout "MAMBA_F45_128K_F4201", BLHeli_32 Rev 32.8
+(odczytane z ESC info). Rev32.8 nie ma EDT (od 32.10), wiec 'edt' nie
+zadziala - temperatura/napiecie/prad tylko przez KISS. BLHeli_32 jest
+zamkniete (08/2024) - aktualizacja do 32.10 niemozliwa.
+
+7. KONSOLA USB (COM3) - sciaga komend
+---------------------------------------------------------------------
+  help                     lista komend
+  t <m|all|e1|e2> <pct>    gaz w % (0 = stop; w 3D: -100..100)
+  raw <m> <0..2047>        surowa wartosc DShot
+  s                        STOP wszystkie
+  cmd <m> <0..47> [n]      komenda DShot
+  edt / 3d on|off / dir <m> n|r / save / beep [1-5]
+  poles <n>                bieguny silnika (RPM)
+  rate 150|300|600|1200    predkosc DShot
+  cs <mV/A> / cz           skala i offset pradu
+  log <ms> | off           okres wydruku statusu (domyslnie 500 ms)
+  stat                     jednorazowy status
+  pins                     diagnostyka przewodow TLM/CUR
+  zero                     zeruj liczniki
+Silniki: 1-8 (1-4 = ESC #1, 5-8 = ESC #2), 'e1'/'e2' = caly ESC.
+
+8. BUDOWANIE I WGRYWANIE
+---------------------------------------------------------------------
+Zrodla: CMakeLists.txt, main.c, dshot.c/h, dshot_bidir.pio, kiss.c/h
+Narzedzia (rozszerzenie Pico w VS Code): ~/.pico-sdk (SDK 2.0.0,
+toolchain 13_2_Rel1, cmake 3.28.6, ninja, picotool 2.0.0, pioasm)
+Board: pico2 (RP2350, ARM). Katalogi: build (flash), build_ram (RAM).
+
+Build (bash):
+  export PICO_SDK_PATH=~/.pico-sdk/sdk/2.0.0
+  export PICO_TOOLCHAIN_PATH=~/.pico-sdk/toolchain/13_2_Rel1
+  export PATH=~/.pico-sdk/cmake/v3.28.6/bin:~/.pico-sdk/ninja/v1.12.1:$PATH
+  cmake -S . -B build -G Ninja -DPICO_BOARD=pico2 \
+     -Dpicotool_DIR=~/.pico-sdk/picotool/2.0.0/picotool \
+     -Dpioasm_DIR=~/.pico-sdk/tools/2.0.0/pioasm
+  ninja -C build                      -> build/esc_test.uf2
+  (RAM: to samo z -B build_ram -DRAM_BUILD=ON)
+
+Wgrywanie normalne: BOOTSEL + przeciagnac build/esc_test.uf2 na dysk RP2350
+   lub: picotool load -f build/esc_test.uf2
+
+!!! PROBLEM: flash tej plytki czyta sie jako same zera, zapis nie
+przechodzi weryfikacji (UF2 i picotool). Podejrzenie: wcisniety /
+zablokowany przycisk BOOTSEL (siedzi na CS flasha) albo uszkodzony
+flash. Do czasu naprawy firmware ladujemy do RAM (znika po resecie):
+   ~/.pico-sdk/picotool/2.0.0/picotool/picotool.exe load -x build_ram/esc_test.uf2
+Plytka po resecie wraca do BOOTSEL (bo flash pusty).
+
+9. CO JESZCZE NIE ZROBIONE
+---------------------------------------------------------------------
+  - silniki nie byly jeszcze krecone (test: 't all 10', potem 's')
+  - skala czujnika pradu niezweryfikowana ('cs')
+  - liczba biegunow silnikow do ustawienia ('poles')
+  - tryb 3D i kierunki do ustawienia i zapisania w ESC (BLHeliSuite32 przez Pico, pkt 6a)
+  - czujnik cisnienia (I2C1 GPIO14/15) pominiety na razie
+  - flash RP2350
