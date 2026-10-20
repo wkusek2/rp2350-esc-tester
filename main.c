@@ -660,6 +660,25 @@ int main(void) {
         }
 
         // IMU: po przerwaniu DRDY (INT1 high) albo awaryjnie co 10 ms; cisnienie: maszyna stanow
+        // IMU/cisnienie nieobecne przy starcie albo seria bledow -> ponawiaj inicjalizacje co 2 s
+        {
+            static uint32_t last_retry_ms;
+            if (now - last_retry_ms >= 2000) {
+                if (!g_imu.present || g_imu.err_streak > 50) {
+                    last_retry_ms = now;
+                    bool was = g_imu.present;
+                    if (!imu_init(&g_imu, i2c1, 0x6A)) imu_init(&g_imu, i2c1, 0x6B);
+                    if (g_imu.present && !was) imu_start_cal(&g_imu);
+                }
+                if (!g_press.s[0].present || !g_press.s[1].present) {
+                    last_retry_ms = now;
+                    float p0a = g_press.s[0].p0_mbar, p0b = g_press.s[1].p0_mbar, rho = g_press.rho;
+                    bool a = g_press.s[0].present, b = g_press.s[1].present;
+                    press_init(&g_press, i2c1);
+                    if (a) g_press.s[0].p0_mbar = p0a; if (b) g_press.s[1].p0_mbar = p0b; g_press.rho = rho;
+                }
+            }
+        }
         if (g_imu.present) {
             uint32_t tu = time_us_32();
             if (gpio_get(IMU_INT_PIN) || tu - imu_last_us > 10000) {

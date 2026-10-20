@@ -17,7 +17,7 @@ typedef struct {
     // kalibracja
     float gbias[3];          // deg/s, w osiach czujnika
     bool  calibrating; int cal_n; float cal_acc[3];
-    uint32_t n_samples, n_err;
+    uint32_t n_samples, n_err, err_streak;   // err_streak: kolejne nieudane odczyty
     uint32_t last_ms;
     // remap: body[i] = sign[i] * sensor[map[i]]
     uint8_t map[3]; int8_t sign[3];

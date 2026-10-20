@@ -32,9 +32,13 @@ static bool rd(i2c_inst_t *i2c, uint8_t addr, uint8_t reg, uint8_t *dst, int n) 
 }
 
 bool imu_init(imu_t *imu, i2c_inst_t *i2c, uint8_t addr) {
-    memset(imu, 0, sizeof *imu);
-    imu->addr = addr; imu->q0 = 1.0f;
-    imu->map[0] = 0; imu->map[1] = 1; imu->map[2] = 2; imu->sign[0] = imu->sign[1] = imu->sign[2] = 1;
+    static bool first = true;
+    if (first) {   // pierwsza inicjalizacja: domyslne osie; przy re-init zachowaj remap, bias i liczniki
+        memset(imu, 0, sizeof *imu);
+        imu->map[0] = 0; imu->map[1] = 1; imu->map[2] = 2; imu->sign[0] = imu->sign[1] = imu->sign[2] = 1;
+        first = false;
+    }
+    imu->addr = addr; imu->q0 = 1.0f; imu->q1 = imu->q2 = imu->q3 = 0; imu->present = false; imu->err_streak = 0;
     uint8_t who = 0;
     if (!rd(i2c, addr, REG_WHO_AM_I, &who, 1) || who != WHO_AM_I_VAL) return false;
     bool ok = true;
@@ -97,7 +101,8 @@ static void mahony(imu_t *imu, float gx, float gy, float gz, float ax, float ay,
 
 bool imu_read(imu_t *imu, i2c_inst_t *i2c, float dt_s) {
     uint8_t b[14];
-    if (!rd(i2c, imu->addr, REG_OUT_TEMP_L, b, 14)) { imu->n_err++; return false; }
+    if (!rd(i2c, imu->addr, REG_OUT_TEMP_L, b, 14)) { imu->n_err++; imu->err_streak++; return false; }
+    imu->err_streak = 0;
     int16_t t  = (int16_t)(b[0] | (b[1] << 8));
     int16_t gr[3], ar[3];
     for (int i = 0; i < 3; i++) { gr[i] = (int16_t)(b[2 + 2 * i] | (b[3 + 2 * i] << 8)); ar[i] = (int16_t)(b[8 + 2 * i] | (b[9 + 2 * i] << 8)); }
