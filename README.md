@@ -49,8 +49,11 @@ defined at the top of `main.c`.
 
 ## Build
 
-Requires the Pico SDK 2.x toolchain (the layout installed by the VS Code Pico
-extension in `~/.pico-sdk` works out of the box).
+Requires the Pico SDK **2.1.1 or newer** (tested with 2.3.1). Boards with the
+RP2350 **A4** stepping (e.g. current Waveshare RP2350-Plus) do not boot images
+built with SDK 2.0.0 from flash: the program never enumerates on USB. The
+layout installed by the VS Code Pico extension in `~/.pico-sdk` works out of
+the box; check the SDK version it uses.
 
 ```sh
 cmake -S . -B build -G Ninja -DPICO_BOARD=pico2

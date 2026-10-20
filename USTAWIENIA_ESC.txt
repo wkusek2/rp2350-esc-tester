@@ -190,6 +190,15 @@ Build (bash):
 Wgrywanie normalne: BOOTSEL + przeciagnac build/esc_test.uf2 na dysk RP2350
    lub: picotool load -f build/esc_test.uf2
 
+!!! SDK: plytki RP2350-Plus z krzemem A4 (picotool 'revision: A4') NIE startuja
+z flasha z obrazem z SDK 2.0.0 - trzeba SDK >= 2.1.1 (zainstalowane 2.3.1 w
+~/.pico-sdk/sdk/2.3.1, picotool 2.3.1, pioasm 2.3.1). Katalog build231.
+Stara plytka (krzem A2) ma dodatkowo uszkodzony flash:
+!!! SDK: plytki RP2350-Plus z krzemem A4 (picotool 'revision: A4') NIE startuja
+z flasha z obrazem z SDK 2.0.0 - trzeba SDK >= 2.1.1. Zainstalowane 2.3.1:
+~/.pico-sdk/sdk/2.3.1, picotool/2.3.1, tools/2.3.1. Katalogi: build231 (flash),
+build231_ram (RAM). Nowa plytka (A4) = COM14, stara (A2) = COM3.
+Stara plytka (krzem A2) ma dodatkowo uszkodzony flash:
 !!! PROBLEM: flash tej plytki czyta sie jako same zera, zapis nie
 przechodzi weryfikacji (UF2 i picotool). Podejrzenie: wcisniety /
 zablokowany przycisk BOOTSEL (siedzi na CS flasha) albo uszkodzony
