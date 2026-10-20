@@ -42,6 +42,7 @@ static volatile uint32_t g_loop_cnt = 0;
 static volatile int8_t   g_tlm_req_motor[2] = { -1, -1 };  // ostatni silnik z bitem telemetrii (per ESC)
 static volatile uint32_t g_tlm_req_ms[2];
 static dshot_tlm_t g_tlm[N_MOTORS];
+static int bb_scan(uint sda, uint scl, char *out, int outlen);
 static volatile bool g_req_4way, g_4way_active;   // tryb 4-way (BLHeliSuite)
 static uint32_t g_4way_enter_ms;
 static bool g_4way_quiet;                          // tryb wszedl z Suite - zadnych tekstow na porcie                   // kiedy zatrzymano DShot (linie ciche)
@@ -61,6 +62,13 @@ static void core1_main(void) {
     while (true) {
         if (g_req_probe >= 0) {
             dshot_suspend();
+            if (g_probe_mode == 99) {   // skan I2C bit-bangiem na pinach silnikow GPIO4/5 (stare okablowanie czujnikow)
+                int n = 0; char o[128]; int f;
+                for (int k = 0; k < 2; k++) { uint pp = k ? 5 : 4; gpio_set_function(pp, GPIO_FUNC_SIO); gpio_set_dir(pp, GPIO_IN); gpio_set_pulls(pp, false, true); sleep_ms(5);
+                    int hi = 0; for (int i = 0; i < 100; i++) { hi += gpio_get(pp); sleep_us(50); } n += snprintf(g_probe_out + n, sizeof g_probe_out - n, "GPIO%u z pull-down: %d%% high; ", pp, hi); }
+                f = bb_scan(4, 5, o, sizeof o); n += snprintf(g_probe_out + n, sizeof g_probe_out - n, "\nbit-bang SDA=GPIO4 SCL=GPIO5:%s (%d)\n", f ? o : " nic", f);
+                f = bb_scan(5, 4, o, sizeof o); n += snprintf(g_probe_out + n, sizeof g_probe_out - n, "bit-bang SDA=GPIO5 SCL=GPIO4:%s (%d)\n", f ? o : " nic", f);
+            } else
             fourway_probe(g_req_probe, g_probe_mode, g_probe_hold, g_probe_out, sizeof g_probe_out);
             dshot_resume();
             g_req_probe = -1; g_probe_done = true;
@@ -395,6 +403,29 @@ static bool msp_feed(uint8_t ch) {
     msp_st = 0; return false;
 }
 
+// skan I2C bit-bangiem (open-drain przez kierunek pinu) - do wykrycia zamienionych SDA/SCL
+static int bb_scan(uint sda, uint scl, char *out, int outlen) {
+    gpio_set_function(sda, GPIO_FUNC_SIO); gpio_set_function(scl, GPIO_FUNC_SIO);
+    gpio_put(sda, 0); gpio_put(scl, 0); gpio_set_dir(sda, GPIO_IN); gpio_set_dir(scl, GPIO_IN);
+    gpio_set_pulls(sda, true, false); gpio_set_pulls(scl, true, false);
+    #define SDA_H gpio_set_dir(sda, GPIO_IN)
+    #define SDA_L gpio_set_dir(sda, GPIO_OUT)
+    #define SCL_H gpio_set_dir(scl, GPIO_IN)
+    #define SCL_L gpio_set_dir(scl, GPIO_OUT)
+    int n = 0, found = 0;
+    for (int k = 0; k < 9; k++) { SCL_L; sleep_us(5); SCL_H; sleep_us(5); }   // bus recovery
+    for (int a = 0x08; a < 0x78; a++) {
+        SDA_H; SCL_H; sleep_us(5); SDA_L; sleep_us(5); SCL_L; sleep_us(5);      // START
+        uint8_t b = (uint8_t)(a << 1);
+        for (int i = 7; i >= 0; i--) { if (b & (1 << i)) SDA_H; else SDA_L; sleep_us(3); SCL_H; sleep_us(5); SCL_L; sleep_us(3); }
+        SDA_H; sleep_us(3); SCL_H; sleep_us(5); int ack = !gpio_get(sda); SCL_L; sleep_us(3);
+        SDA_L; sleep_us(5); SCL_H; sleep_us(5); SDA_H; sleep_us(10);           // STOP
+        if (ack) { n += snprintf(out + n, outlen - n, " 0x%02X", a); found++; }
+    }
+    gpio_set_function(sda, GPIO_FUNC_I2C); gpio_set_function(scl, GPIO_FUNC_I2C);
+    return found;
+}
+
 static void handle_line(char *line) {
     char *tok[4] = { 0 }; int n = 0;
     for (char *p = strtok(line, " \t\r\n"); p && n < 4; p = strtok(NULL, " \t\r\n")) tok[n++] = p;
@@ -445,6 +476,41 @@ static void handle_line(char *line) {
     else if (!strcmp(c, "pins")) print_pins();
     else if (!strcmp(c, "4way")) start_4way(false);
     else if (!strcmp(c, "msplog")) print_msplog();
+    else if (!strcmp(c, "i2c")) {       // diagnostyka I2C1: poziomy linii z pull-down (1 = zewnetrzny pull-up) + skan adresow
+        int lv[2];
+        const uint pins2[2] = { I2C_SDA_PIN, I2C_SCL_PIN };
+        for (int k = 0; k < 2; k++) {
+            gpio_set_function(pins2[k], GPIO_FUNC_SIO); gpio_set_dir(pins2[k], GPIO_IN); gpio_set_pulls(pins2[k], false, true);
+            sleep_ms(5); lv[k] = 0; for (int i = 0; i < 100; i++) { lv[k] += gpio_get(pins2[k]); sleep_us(50); }
+            gpio_set_pulls(pins2[k], true, false); gpio_set_function(pins2[k], GPIO_FUNC_I2C);
+        }
+        printf("SDA(GPIO%d) z pull-down: %d%% high, SCL(GPIO%d): %d%% high  -> %s\n", I2C_SDA_PIN, lv[0], I2C_SCL_PIN, lv[1],
+               (lv[0] > 90 && lv[1] > 90) ? "zewnetrzne pull-upy sa (cos podpiete)" : "BRAK zewnetrznych pull-upow - czujniki nie sa na tych pinach albo brak zasilania");
+        {   // test zwarcia SDA-SCL: jedna linia na 0, czytaj druga
+            gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_SIO); gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_SIO);
+            gpio_set_dir(I2C_SDA_PIN, GPIO_OUT); gpio_put(I2C_SDA_PIN, 0); gpio_set_dir(I2C_SCL_PIN, GPIO_IN); gpio_set_pulls(I2C_SCL_PIN, true, false); sleep_ms(2);
+            int scl_when_sda0 = gpio_get(I2C_SCL_PIN);
+            gpio_set_dir(I2C_SDA_PIN, GPIO_IN); gpio_set_pulls(I2C_SDA_PIN, true, false);
+            gpio_set_dir(I2C_SCL_PIN, GPIO_OUT); gpio_put(I2C_SCL_PIN, 0); sleep_ms(2);
+            int sda_when_scl0 = gpio_get(I2C_SDA_PIN);
+            gpio_set_dir(I2C_SCL_PIN, GPIO_IN);
+            gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C); gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+            printf("SDA=0 -> SCL=%d, SCL=0 -> SDA=%d  -> %s\n", scl_when_sda0, sda_when_scl0,
+                   (scl_when_sda0 && sda_when_scl0) ? "linie niezalezne (OK)" : "ZWARCIE SDA-SCL albo linia nie moze zejsc do 0");
+        }
+        printf("skan I2C1:");
+        int found = 0;
+        for (int a = 0x08; a < 0x78; a++) { uint8_t d; if (i2c_read_timeout_us(i2c1, (uint8_t)a, &d, 1, false, 2000) >= 0) { printf(" 0x%02X", a); found++; } }
+        printf("%s (%d)\n", found ? "" : " nic", found);
+        { char o[128]; int f;
+          f = bb_scan(I2C_SDA_PIN, I2C_SCL_PIN, o, sizeof o); printf("bit-bang SDA=GPIO%d SCL=GPIO%d:%s (%d)\n", I2C_SDA_PIN, I2C_SCL_PIN, f ? o : " nic", f);
+          f = bb_scan(I2C_SCL_PIN, I2C_SDA_PIN, o, sizeof o); printf("bit-bang ZAMIENIONE SDA=GPIO%d SCL=GPIO%d:%s (%d)\n", I2C_SCL_PIN, I2C_SDA_PIN, f ? o : " nic", f);
+          i2c_init(i2c1, 400000); }
+        if (!imu_init(&g_imu, i2c1, 0x6A)) imu_init(&g_imu, i2c1, 0x6B);
+        if (g_imu.present) imu_start_cal(&g_imu);
+        press_init(&g_press, i2c1);
+        printf("IMU %s, MS5837 %s, MS5803 %s\n", g_imu.present ? "OK" : "brak", g_press.s[0].present ? "OK" : "brak", g_press.s[1].present ? "OK" : "brak");
+    }
     else if (!strcmp(c, "env")) print_env();
     else if (!strcmp(c, "imucal")) { imu_start_cal(&g_imu); printf("kalibracja zyro: nie ruszac 2 s\n"); }
     else if (!strcmp(c, "axes")) {

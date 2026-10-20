@@ -25,7 +25,7 @@ telemetry, and lets **BLHeliSuite32 configure the ESCs directly through the Pico
   bus, non-blocking state machine, surface zeroing, water density setting.
 - Failsafe: all motors stop when USB disconnects.
 
-IMU and pressure drivers are written but not yet verified on hardware.
+Pressure sensors verified on hardware (both, ~285 Hz, 0 errors); IMU driver not yet verified.
 Tested with 2x Diatone MAMBA F45 128K (BLHeli_32 Rev 32.8, layout
 `MAMBA_F45_128K_F4201`).
 
