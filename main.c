@@ -18,11 +18,12 @@
 #include "hardware/i2c.h"
 
 // ---- pinout ----
-static const uint8_t MOTOR_PINS[N_MOTORS] = { 2, 3, 4, 5, 10, 11, 12, 13 };
-#define TLM0_RX_PIN 1    // UART0 RX  <- ESC #1 TLM
-#define TLM1_RX_PIN 9    // UART1 RX  <- ESC #2 TLM
+// ESC #1 na lewej krawedzi (GP9-13, CUR na GP26), ESC #2 na prawej (GP16-19, GP21, GP28)
+static const uint8_t MOTOR_PINS[N_MOTORS] = { 9, 10, 11, 12, 16, 17, 18, 19 };
+#define TLM0_RX_PIN 13   // UART0 RX  <- ESC #1 TLM
+#define TLM1_RX_PIN 21   // UART1 RX  <- ESC #2 TLM
 #define CUR0_PIN   26    // ADC0      <- ESC #1 CUR
-#define CUR1_PIN   27    // ADC1      <- ESC #2 CUR
+#define CUR1_PIN   28    // ADC2      <- ESC #2 CUR
 #define I2C_SDA_PIN 14   // I2C1 SDA  <- IMU LSM6DSO32 + MS5837 (0x76) + MS5803 (0x77)
 #define I2C_SCL_PIN 15   // I2C1 SCL
 #define IMU_INT_PIN  6   // LSM6DSO32 INT1 (DRDY zyro)
@@ -43,12 +44,44 @@ static volatile int8_t   g_tlm_req_motor[2] = { -1, -1 };  // ostatni silnik z b
 static volatile uint32_t g_tlm_req_ms[2];
 static dshot_tlm_t g_tlm[N_MOTORS];
 static int bb_scan(uint sda, uint scl, char *out, int outlen);
+// skan okablowania: dla kazdego GPIO poziom z pull-down / pull-up, zbocza (aktywnosc), ADC dla 26-28
+static void pinscan(char *out, int outlen) {
+    static const uint8_t pins[] = { 0,1,2,3,4,5,6,7,8,9,10,11,12,13,16,17,18,19,20,21,22,26,27,28 };
+    int n = 0;
+    for (unsigned k = 0; k < sizeof pins; k++) {
+        uint p = pins[k];
+        gpio_set_function(p, GPIO_FUNC_SIO); gpio_set_dir(p, GPIO_IN);
+        int hi[2];
+        for (int mode = 0; mode < 2; mode++) {
+            gpio_set_pulls(p, mode == 1, mode == 0); sleep_ms(3); hi[mode] = 0;
+            for (int i = 0; i < 200; i++) { hi[mode] += gpio_get(p); sleep_us(25); }
+        }
+        gpio_set_pulls(p, false, false); sleep_ms(2);
+        int edges = 0, last = gpio_get(p); uint32_t t0 = time_us_32();
+        while (time_us_32() - t0 < 60000) { int v = gpio_get(p); if (v != last) { edges++; last = v; } }
+        const char *what;
+        if (hi[0] < 5 && hi[1] > 195)       what = "nic (plywa)";
+        else if (hi[0] > 195 && hi[1] > 195) what = edges > 20 ? "TLM: trzymana wysoko + UART" : "trzymana wysoko (TLM idle / wejscie ESC z pull-up)";
+        else if (hi[0] < 5 && hi[1] < 5)     what = "trzymana nisko (CUR? / wejscie ESC z pull-down / zwarcie)";
+        else                                 what = "posrednie / aktywne";
+        n += snprintf(out + n, outlen - n, "GP%-2u pd=%3d%% pu=%3d%% zbocza=%-4d %s", p, hi[0] / 2, hi[1] / 2, edges, what);
+        if (p >= 26 && p <= 28) { adc_gpio_init(p); adc_select_input(p - 26); uint32_t a = 0; for (int i = 0; i < 16; i++) a += adc_read(); n += snprintf(out + n, outlen - n, "  ADC=%4.0f mV", a / 16.0f * 3300.0f / 4095.0f); }
+        n += snprintf(out + n, outlen - n, "\n");
+        if (n > outlen - 120) break;
+    }
+    // przywroc funkcje pinow (silniki przywroci dshot_resume)
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C); gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(TLM0_RX_PIN, (TLM0_RX_PIN % 4 == 1) ? GPIO_FUNC_UART : GPIO_FUNC_UART_AUX);
+    gpio_set_function(TLM1_RX_PIN, (TLM1_RX_PIN % 4 == 1) ? GPIO_FUNC_UART : GPIO_FUNC_UART_AUX);
+    adc_gpio_init(CUR0_PIN); adc_gpio_init(CUR1_PIN);
+    gpio_init(IMU_INT_PIN); gpio_set_dir(IMU_INT_PIN, GPIO_IN); gpio_pull_down(IMU_INT_PIN);
+}
 static volatile bool g_req_4way, g_4way_active;   // tryb 4-way (BLHeliSuite)
 static uint32_t g_4way_enter_ms;
 static bool g_4way_quiet;                          // tryb wszedl z Suite - zadnych tekstow na porcie                   // kiedy zatrzymano DShot (linie ciche)
 #define ESC_QUIET_MS 5000                          // BLHeli_32: tyle ciszy (linia high) zanim wejdzie w bootloader
 static volatile int  g_req_probe = -1, g_probe_mode, g_probe_hold;             // bl <m>: diagnostyka bootloadera
-static char g_probe_out[2048];
+static char g_probe_out[4096];
 static volatile bool g_probe_done;
 
 // ---- core1: petla DShot ----
@@ -69,7 +102,8 @@ static void core1_main(void) {
                 f = bb_scan(4, 5, o, sizeof o); n += snprintf(g_probe_out + n, sizeof g_probe_out - n, "\nbit-bang SDA=GPIO4 SCL=GPIO5:%s (%d)\n", f ? o : " nic", f);
                 f = bb_scan(5, 4, o, sizeof o); n += snprintf(g_probe_out + n, sizeof g_probe_out - n, "bit-bang SDA=GPIO5 SCL=GPIO4:%s (%d)\n", f ? o : " nic", f);
             } else
-            fourway_probe(g_req_probe, g_probe_mode, g_probe_hold, g_probe_out, sizeof g_probe_out);
+            if (g_probe_mode == 98) pinscan(g_probe_out, sizeof g_probe_out);
+            else fourway_probe(g_req_probe, g_probe_mode, g_probe_hold, g_probe_out, sizeof g_probe_out);
             dshot_resume();
             g_req_probe = -1; g_probe_done = true;
             next = get_absolute_time();
@@ -185,7 +219,7 @@ static void send_cmd(uint8_t mask, int cmd, int n) {
 }
 
 static float read_cur_mv(int ch) {
-    adc_select_input((uint)ch);
+    adc_select_input((uint)((ch ? CUR1_PIN : CUR0_PIN) - 26));
     uint32_t acc = 0;
     for (int i = 0; i < 32; i++) acc += adc_read();
     return (float)acc / 32.0f * 3300.0f / 4095.0f;
@@ -194,7 +228,7 @@ static float read_cur_mv(int ch) {
 
 // diagnostyka linii TLM: procent probek w stanie wysokim z pull-up / pull-down / bez
 static void print_pins(void) {
-    const uint pins[4] = { TLM0_RX_PIN, TLM1_RX_PIN, 0, 8 };
+    const uint pins[4] = { TLM0_RX_PIN, TLM1_RX_PIN, 12, 20 };
     for (int e = 0; e < 4; e++) {
         uint p = pins[e];
         gpio_set_function(p, GPIO_FUNC_SIO); gpio_set_dir(p, false);
@@ -476,6 +510,12 @@ static void handle_line(char *line) {
     else if (!strcmp(c, "pins")) print_pins();
     else if (!strcmp(c, "4way")) start_4way(false);
     else if (!strcmp(c, "msplog")) print_msplog();
+    else if (!strcmp(c, "pinscan")) {
+        if (any_running()) { printf("najpierw s\n"); return; }
+        g_probe_done = false; g_probe_mode = 98; g_req_probe = 0;
+        while (!g_probe_done) sleep_ms(10);
+        printf("%s", g_probe_out);
+    }
     else if (!strcmp(c, "i2c")) {       // diagnostyka I2C1: poziomy linii z pull-down (1 = zewnetrzny pull-up) + skan adresow
         int lv[2];
         const uint pins2[2] = { I2C_SDA_PIN, I2C_SCL_PIN };
